@@ -141,6 +141,10 @@ def _copy_weight_view_before_h2d(loaded_weight: torch.Tensor) -> torch.Tensor:
 def _maybe_copy_weight_view_before_h2d(
     loaded_weight: torch.Tensor,
 ) -> torch.Tensor:
+    if envs.SGLANG_K3_FORCE_CPU_CONTIGUOUS.get():
+        if loaded_weight.device.type == "cpu":
+            return loaded_weight.clone(memory_format=torch.contiguous_format)
+        return loaded_weight
     if not envs.SGLANG_MOE_COPY_WEIGHT_VIEWS_BEFORE_H2D.get():
         return loaded_weight
     return _copy_weight_view_before_h2d(loaded_weight)
