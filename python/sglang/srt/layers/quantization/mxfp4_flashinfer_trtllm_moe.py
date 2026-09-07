@@ -77,6 +77,20 @@ class Mxfp4FlashinferTrtllmMoEMethod:
             else None
         )
 
+    def rehydrate_ipc_runtime_state(self, layer) -> None:
+        """Move the private clamp tensor off meta after IPC weight mapping."""
+        limit = getattr(self.moe_runner_config, "swiglu_limit", None)
+        self._gemm1_clamp_limit_tensor = (
+            torch.full(
+                (layer.num_local_experts,),
+                float(limit),
+                dtype=torch.float32,
+                device=layer.w13_weight.device,
+            )
+            if limit is not None
+            else None
+        )
+
     def create_weights(
         self,
         layer,

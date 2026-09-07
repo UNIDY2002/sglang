@@ -183,6 +183,42 @@ class Mxfp4FlashinferCutlassMoEMethod:
         if not self._use_mxfp8_act_scaling:
             torch.cuda.empty_cache()
 
+    def rehydrate_ipc_runtime_state(self, layer: Module) -> None:
+        """Recreate private CUTLASS inputs after CUDA IPC weight mapping."""
+        device = layer.w13_weight.device
+        if device.type == "meta":
+            raise RuntimeError(
+                "MXFP4 IPC runtime state cannot be rebuilt while weights are on meta"
+            )
+
+        if self._use_mxfp8_act_scaling:
+            self._mxfp4_weight_global_scale_tensor = torch.ones(
+                layer.num_local_experts, dtype=torch.float32, device=device
+            )
+        else:
+            self._mxfp4_weight_global_scale_tensor = None
+
+        config = self.moe_runner_config
+        swiglu_limit = getattr(config, "swiglu_limit", None)
+        gemm1_clamp_limit = getattr(config, "gemm1_clamp_limit", None)
+        self._use_swiglu_step = (
+            gemm1_clamp_limit is not None
+            and getattr(config, "gemm1_alpha", None) is None
+        )
+        clamp_limit = (
+            gemm1_clamp_limit if gemm1_clamp_limit is not None else swiglu_limit
+        )
+        self._swiglu_limit_tensor = (
+            torch.full(
+                (layer.num_local_experts,),
+                float(clamp_limit),
+                dtype=torch.float32,
+                device=device,
+            )
+            if clamp_limit is not None
+            else None
+        )
+
     def apply(
         self,
         layer: Module,

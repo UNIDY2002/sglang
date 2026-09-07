@@ -156,13 +156,13 @@ class IpcModelLoader(BaseModelLoader):
             device_config,
             entries,
             quant_config,
+            allow_packed_mxfp4=bool(getattr(model_config, "is_fp4_experts", False)),
         )
         self.preloaded_weights_bytes = preloaded_weights_bytes
 
-        # Skip _post_load_weights: the daemon already ran
-        # process_weights_after_loading on the weights before exporting
-        # IPC handles. Running it again would double-process (e.g.,
-        # re-quantize already-quantized weights), corrupting tensor data.
+        # Skip quant_method.process_weights_after_loading: daemon exports
+        # already-transformed weights. Model-level post-load fixups still run
+        # below to restore derived state and references after IPC mapping.
 
         # Rebuild stale tensor views. Some modules store tensor views as
         # plain attributes (not parameters/buffers) during __init__. When
@@ -260,7 +260,7 @@ class IpcModelLoader(BaseModelLoader):
         try:
             from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
         except ImportError:
-            return
+            RadixLinearAttention = None
 
         count = 0
         for _, module in model.named_modules():
@@ -268,7 +268,11 @@ class IpcModelLoader(BaseModelLoader):
             if conv1d is None:
                 conv1d = getattr(module, "qkv_conv1d", None)
             attn = getattr(module, "attn", None)
-            if conv1d is not None and isinstance(attn, RadixLinearAttention):
+            if (
+                RadixLinearAttention is not None
+                and conv1d is not None
+                and isinstance(attn, RadixLinearAttention)
+            ):
                 if hasattr(conv1d, "weight") and conv1d.weight is not None:
                     attn.conv_weights = conv1d.weight.view(
                         conv1d.weight.size(0), conv1d.weight.size(2)
@@ -299,8 +303,34 @@ class IpcModelLoader(BaseModelLoader):
             ):
                 topk_config.correction_bias = gate.e_score_correction_bias
 
+            # DeepSeek V4 attention helpers keep plain references to the
+            # registered RoPE buffer. IPC replaces the owner buffer by name;
+            # refresh these aliases immediately after mapping.
+            freqs_cis = getattr(module, "freqs_cis", None)
+            if isinstance(freqs_cis, torch.Tensor):
+                for child_name in ("indexer", "compressor"):
+                    child = getattr(module, child_name, None)
+                    if child is not None and hasattr(child, "freqs_cis"):
+                        child.freqs_cis = freqs_cis
+
         if count > 0:
             logger.info(f"[IpcModelLoader] Rebuilt {count} stale conv_weights views")
+
+    @staticmethod
+    def _rehydrate_quant_runtime_state(model):
+        """Recreate quantizer-owned CUDA state created during meta init."""
+        quant_count = 0
+        for module in model.modules():
+            quant_method = getattr(module, "quant_method", None)
+            hook = getattr(quant_method, "rehydrate_ipc_runtime_state", None)
+            if hook is not None:
+                hook(module)
+                quant_count += 1
+        if quant_count:
+            logger.info(
+                f"[IpcModelLoader] Rehydrated runtime state for "
+                f"{quant_count} quantization module(s)"
+            )
 
     @staticmethod
     def _set_module_tensor(model, name, tensor, is_param=True):
@@ -342,6 +372,7 @@ class IpcModelLoader(BaseModelLoader):
         device_config,
         entries,
         quant_config,
+        allow_packed_mxfp4=False,
     ) -> nn.Module:
         """Zero-copy load: map IPC tensors directly as param.data.
 
@@ -376,7 +407,9 @@ class IpcModelLoader(BaseModelLoader):
             name: param
             for name, param in model.named_parameters(remove_duplicate=False)
         }
-        existing_buffers = {name: buf for name, buf in model.named_buffers()}
+        existing_buffers = {
+            name: buf for name, buf in model.named_buffers(remove_duplicate=False)
+        }
         existing_names = set(existing_params) | set(existing_buffers)
 
         imported_refs = []
@@ -387,6 +420,16 @@ class IpcModelLoader(BaseModelLoader):
 
         quant_config = getattr(model_config.hf_config, "quantization_config", None)
         allow_ipc_dtype_adaptation = is_ipc_mxfp4_config(quant_config)
+
+        def is_packed_mxfp4_weight(name):
+            if not allow_packed_mxfp4:
+                return False
+            return name.rsplit(".", 1)[-1] in {
+                "w13_weight",
+                "w2_weight",
+                "w13_weight_scale_inv",
+                "w2_weight_scale_inv",
+            }
 
         # Iterate over ALL daemon entries (not just model params/buffers).
         # This ensures post-quantization parameters (weight_scale, etc.)
@@ -405,10 +448,12 @@ class IpcModelLoader(BaseModelLoader):
                     imported_tensor.shape != ref_param.shape
                     or imported_tensor.dtype != ref_param.dtype
                 ):
-                    if not (
+                    same_shape_dtype_adaptation = (
                         allow_ipc_dtype_adaptation
                         and imported_tensor.shape == ref_param.shape
-                    ):
+                    )
+                    packed_mxfp4_adaptation = is_packed_mxfp4_weight(name)
+                    if not (same_shape_dtype_adaptation or packed_mxfp4_adaptation):
                         mismatched.append(
                             f"  {name}: IPC={imported_tensor.shape}/{imported_tensor.dtype} "
                             f"vs model={ref_param.shape}/{ref_param.dtype}"
@@ -434,6 +479,8 @@ class IpcModelLoader(BaseModelLoader):
                 f"incomplete or the daemon/client configs drifted (a bug to fix), "
                 f"not merely uninitialized weights:\n" + "\n".join(mismatched)
             )
+
+        self._rehydrate_quant_runtime_state(model)
 
         # After mapping every daemon entry, any tensor still on the meta device
         # is one the daemon did NOT provide. Filling it with torch.empty() would

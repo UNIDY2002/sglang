@@ -439,7 +439,9 @@ class WeightCacheDaemon:
         # Also export non-persistent buffers (not in state_dict but needed
         # for inference, e.g. rotary embedding cos_sin_cache)
         non_persistent_count = 0
-        for name, buf in self.model.named_buffers():
+        # IPC replaces tensors by name, so every alias needs an entry even
+        # when multiple layers share the same non-persistent buffer storage.
+        for name, buf in self.model.named_buffers(remove_duplicate=False):
             if name not in state_dict_names:
                 state_tensors[name] = (buf.data, False)
                 non_persistent_count += 1
